@@ -1,0 +1,6 @@
+<launch>
+
+	<node pkg="imu_pkg" name="imu_node" type="imu_node" />
+	<node pkg="rviz" name="rviz1" type="rviz" args="-d $(find imu_pkg)/rviz/view.rviz" />
+	
+</launch>

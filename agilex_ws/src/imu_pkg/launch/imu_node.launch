@@ -1,0 +1,7 @@
+<launch>
+	rosrun imu_pkg imu_node
+	<node pkg="imu_pkg" name="imu_node" type="imu_node" />
+	
+	<!-- <node pkg="rviz" name="rviz_chaohe_imu" type="rviz" /> -->
+	
+</launch>
