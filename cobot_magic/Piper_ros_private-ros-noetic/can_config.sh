@@ -1,205 +1,189 @@
 #!/bin/bash
-set -euo pipefail
+declare -A USB_PORTS 
 
-# -------------------------- 配置区 --------------------------
-# 可通过外部配置文件覆盖，格式：USB_PORTS["usb_port"]="can_name:bitrate"
-declare -A USB_PORTS=(
-    ["1-13:1.0"]="can_left:1000000"
-    ["1-12:1.0"]="can_right:1000000"
-    ["1-4:1.0"]="can_ugv:500000"
-)
+# USB_PORTS["3-1.3:1.0"]="can_arm:1000000"
+USB_PORTS["1-13:1.0"]="can_left:1000000"
+USB_PORTS["1-12:1.0"]="can_right:1000000"
+USB_PORTS["1-4:1.0"]="can_ugv:500000"
+# USB_PORTS["3-1.5:1.0"]="can_arm1:1000000"
 
-# 是否忽略CAN数量检查（默认false）
+# Whether to ignore CAN quantity check (default false)
 IGNORE_CHECK=false
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # 重置颜色
-
-# -------------------------- 工具函数 --------------------------
-# 日志输出函数
-log_info() { echo -e "${BLUE}[INFO]${NC}: $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC}: $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC}: $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC}: $1"; }
-
-# 权限检查
-check_permission() {
-    if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO_USER" ]; then
-        log_error "This script must be run as root or with sudo."
-        exit 1
-    fi
-}
-
-# -------------------------- 主逻辑 --------------------------
-# 1. 初始化检查
-check_permission
-
-# 2. 解析参数
+# Parsing parameters
 for arg in "$@"; do
     if [ "$arg" == "--ignore" ]; then
         IGNORE_CHECK=true
-        log_info "Ignoring CAN quantity check."
     fi
 done
 
-# 3. 检查USB_PORTS配置（重复目标名）
-log_info "Checking USB_PORTS configuration..."
+# Step 1: 打印 USB_PORTS 映射，同时检测是否存在重复目标名
+echo "🔧 Checking USB_PORTS configuration:"
 declare -A TARGET_NAMES_COUNT
+LINE_NUM=0
 HAS_DUPLICATE=false
 
 for k in "${!USB_PORTS[@]}"; do
+    LINE_NUM=$((LINE_NUM + 1))
     IFS=':' read -r name bitrate <<< "${USB_PORTS[$k]}"
-    # 使用${变量:-}避免未定义变量错误
-    if [[ -n "${TARGET_NAMES_COUNT[$name]:-}" ]]; then
-        log_error "Duplicate target CAN name: '$name' (USB port: $k)"
+    
+    # 检查是否重复
+    if [[ -n "${TARGET_NAMES_COUNT[$name]}" ]]; then
+        echo "→ [$LINE_NUM] \"$k\"=\"${USB_PORTS[$k]}\"  ❌ Duplicate target CAN name: '$name'"
         HAS_DUPLICATE=true
     else
+        echo "  [$LINE_NUM] \"$k\"=\"${USB_PORTS[$k]}\""
         TARGET_NAMES_COUNT["$name"]=1
     fi
 done
 
 if $HAS_DUPLICATE; then
-    log_error "Found duplicate target CAN interface names. Exiting."
+    echo "❌ [ERROR]: Found duplicate target CAN interface name(s) above. Please resolve before proceeding."
     exit 1
 fi
 
-# -------------------------- 检查目标名是否已存在 --------------------------
-log_info "Checking for existing target CAN interface names..."
-HAS_EXISTING_TARGET=false
-
-for k in "${!USB_PORTS[@]}"; do
-    IFS=':' read -r TARGET_NAME TARGET_BITRATE <<< "${USB_PORTS[$k]}"
-    # 静默检查目标名是否存在
-    if ip link show "$TARGET_NAME" &>/dev/null; then
-        log_error "Target CAN interface name '$TARGET_NAME' already exists (mapped to USB port: $k)"
-        HAS_EXISTING_TARGET=true
-    fi
-done
-
-if $HAS_EXISTING_TARGET; then
-    log_error "Found existing target CAN interface names. Script execution aborted.Please remove and insert all USB_CAN device"
-    exit -1
-fi
-# -------------------------- 检查目标名是否已存在 --------------------------
-
-# 4. CAN数量校验
 PREDEFINED_COUNT=${#USB_PORTS[@]}
 CURRENT_CAN_COUNT=$(ip link show type can | grep -c "link/can")
 
 if [ "$IGNORE_CHECK" = false ] && [ "$CURRENT_CAN_COUNT" -ne "$PREDEFINED_COUNT" ]; then
-    log_warn "Detected CAN modules ($CURRENT_CAN_COUNT) != Expected ($PREDEFINED_COUNT)"
+    echo "[WARN]: The detected number of CAN modules ($CURRENT_CAN_COUNT) does not match the expected number ($PREDEFINED_COUNT)."
     read -p "Do you want to continue? (y/N): " user_input
-    if [[ ! "$user_input" =~ ^[yY]([eE][sS])?$ ]]; then
-        log_info "Exited by user."
-        exit 1
-    fi
+    case "$user_input" in
+        [yY]|[yY][eE][sS])
+            echo "Continue execution..."
+            ;;
+        *)
+            echo "Exited."
+            exit 1
+            ;;
+    esac
+else
+    echo "CAN quantity check ignored or matched, continuing..."
 fi
 
-# 5. 加载gs_usb驱动
-log_info "Loading gs_usb module..."
-if ! sudo modprobe gs_usb; then
-    log_error "Failed to load gs_usb module."
+# Load the gs_usb module
+sudo modprobe gs_usb
+if [ $? -ne 0 ]; then
+    echo "[ERROR]: Unable to load gs_usb module."
     exit 1
 fi
 
-# 6. 初始化统计
-SUCCESS_COUNT=0
-FAILED_COUNT=0
+SUCCESS_COUNT=0  # Number of CAN interfaces successfully processed
+FAILED_COUNT=0   # Expected number of interfaces that failed or were not processed
+
+# Copy a list of USB_PORTS keys and mark each one for success
 declare -A USB_PORT_STATUS
 for k in "${!USB_PORTS[@]}"; do
     USB_PORT_STATUS["$k"]="pending"
 done
+# Handle multiple CAN modules
+# Iterate over all CAN interfaces
+SYS_INTERFACE=$(ip -br link show type can | awk '{print $1}')
 
-# 7. 获取系统CAN接口列表
-mapfile -t SYS_INTERFACE < <(ip -br link show type can | awk '{print $1}')
-log_info "Detected CAN interfaces: ${SYS_INTERFACE[*]}"
-
-# 8. 配置每个CAN接口
-for iface in "${SYS_INTERFACE[@]}"; do
-    log_info "Processing interface: $iface"
-    
-    # 获取bus-info并清洗
-    BUS_INFO=$(sudo ethtool -i "$iface" | grep "bus-info" | awk '{print $2}' | tr -d ' ' | tr '[:upper:]' '[:lower:]')
-    if [ -z "$BUS_INFO" ]; then
-        log_error "Failed to get bus-info for $iface"
-        continue
-    fi
-
-    # 匹配预定义USB端口（使用${变量:-}避免未定义变量）
-    if [ -z "${USB_PORTS[$BUS_INFO]:-}" ]; then
-        log_warn "USB port $BUS_INFO (interface $iface) not in predefined list."
-        continue
-    fi
-
-    # 解析目标配置
-    IFS=':' read -r TARGET_NAME TARGET_BITRATE <<< "${USB_PORTS[$BUS_INFO]}"
-
-    # 检查目标名是否已存在
-    if ip link show "$TARGET_NAME" &>/dev/null; then
-        log_warn "Target name $TARGET_NAME already exists. Deleting it..."
-        sudo ip link set "$TARGET_NAME" down
-        sudo ip link delete "$TARGET_NAME" || {
-            log_error "Failed to delete $TARGET_NAME"
-            continue
-        }
-    fi
-
-    # 获取当前接口状态
-    IS_LINK_UP=$(ip link show "$iface" | grep -q "UP" && echo "yes" || echo "no")
-    CURRENT_BITRATE=$(ip -details link show "$iface" | grep -oP 'bitrate \K\d+' || echo 0)
-
-    # 配置比特率和激活
-    if [ "$IS_LINK_UP" != "yes" ] || [ "$CURRENT_BITRATE" -ne "$TARGET_BITRATE" ]; then
-        log_info "Configuring $iface to bitrate $TARGET_BITRATE..."
-        sudo ip link set "$iface" down
-        sudo ip link set "$iface" type can bitrate "$TARGET_BITRATE"
-        sudo ip link set "$iface" up
-    fi
-
-    # 重命名接口
-    if [ "$iface" != "$TARGET_NAME" ]; then
-        log_info "Renaming $iface to $TARGET_NAME..."
-        sudo ip link set "$iface" down
-        sudo ip link set "$iface" name "$TARGET_NAME"
-        sudo ip link set "$TARGET_NAME" up
-    fi
-
-    # 更新统计
-    SUCCESS_COUNT=$((SUCCESS_COUNT+1))
-    USB_PORT_STATUS["$BUS_INFO"]="success"
-    log_success "Interface $TARGET_NAME configured successfully."
+echo -e "\n🔍 [INFO]: The following CAN interfaces were detected in the system:"
+for iface in $SYS_INTERFACE; do
+    echo "  - $iface"
 done
 
-# 9. 统计失败的USB端口
+echo -e "\n⚠️  [HINT]: Please make sure none of the above interface names conflict with the predefined names in your USB_PORTS config."
+
+for iface in $SYS_INTERFACE; do
+    # Get bus-info using ethtool
+    echo "--------------------------- $iface ------------------------------"
+    BUS_INFO=$(sudo ethtool -i "$iface" | grep "bus-info" | awk '{print $2}')
+    
+    if [ -z "$BUS_INFO" ];then
+        echo "[ERROR]: Unable to get bus-info information for interface '$iface'."
+        continue
+    fi
+    
+    echo "[INFO]: System interface '$iface' is plugged into USB port '$BUS_INFO'"
+    # Check if bus-info is in the list of predefined USB ports
+    if [ -n "${USB_PORTS[$BUS_INFO]}" ];then
+        IFS=':' read -r TARGET_NAME TARGET_BITRATE <<< "${USB_PORTS[$BUS_INFO]}"
+        
+        # Check if the current interface is activated
+        IS_LINK_UP=$(ip link show "$iface" | grep -q "UP" && echo "yes" || echo "no")
+
+        # Get the bit rate of the current interface
+        CURRENT_BITRATE=$(ip -details link show "$iface" | grep -oP 'bitrate \K\d+')
+        
+        if [ "$IS_LINK_UP" = "yes" ] && [ "$CURRENT_BITRATE" -eq "$TARGET_BITRATE" ]; then
+            echo "[INFO]: Interface '$iface' is activated and bitrate is $TARGET_BITRATE"
+            
+            # Check if the interface name matches the target name
+            if [ "$iface" != "$TARGET_NAME" ]; then
+                echo "[INFO]: Rename interface '$iface' to '$TARGET_NAME'"
+                sudo ip link set "$iface" down
+                sudo ip link set "$iface" name "$TARGET_NAME"
+                sudo ip link set "$TARGET_NAME" up
+                echo "[INFO]: The interface was renamed to '$TARGET_NAME' and reactivated."
+            else
+                echo "[INFO]: The USB port '$BUS_INFO' interface name is already '$TARGET_NAME'"
+            fi
+        else
+            if ip link show "$TARGET_NAME" &>/dev/null; then
+                echo "[WARN]: Cannot rename '$iface' to '$TARGET_NAME' because interface '$TARGET_NAME' already exists."
+                echo "[HINT]: Please check if another interface already occupies this name, or fix your USB_PORTS configuration."
+                echo "-----------------------------------------------------------------"
+                continue
+            fi
+            # if ip link show "$TARGET_NAME" &>/dev/null; then
+            #     echo "[WARN]: Interface '$TARGET_NAME' already exists. Deleting to allow renaming."
+            #     sudo ip link delete "$TARGET_NAME"
+            # fi
+            # If the interface is not active or the bit rate is different, set
+            if [ "$IS_LINK_UP" = "yes" ]; then
+                echo "[INFO]: Interface '$iface' is activated, but the bitrate $CURRENT_BITRATE does not match the set $TARGET_BITRATE."
+            else
+                echo "[INFO]: Interface '$iface' is not activated or the bitrate is not set."
+            fi
+            
+            # Set the interface bit rate and activate it
+            sudo ip link set "$iface" down
+            sudo ip link set "$iface" type can bitrate $TARGET_BITRATE
+            sudo ip link set "$iface" up
+            echo "[INFO]: Interface '$iface' has been reset to bitrate $TARGET_BITRATE and activated."
+            
+            # Rename the interface to the target name
+            if [ "$iface" != "$TARGET_NAME" ]; then
+                echo "[INFO]: Rename interface $iface to '$TARGET_NAME'"
+                sudo ip link set "$iface" down
+                sudo ip link set "$iface" name "$TARGET_NAME"
+                sudo ip link set "$TARGET_NAME" up
+                echo "[INFO]: The interface was renamed to '$TARGET_NAME' and reactivated."
+            fi
+        fi
+        SUCCESS_COUNT=$((SUCCESS_COUNT+1))
+        USB_PORT_STATUS["$BUS_INFO"]="success"
+    else
+        # echo "↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓---err---↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓"
+        echo "[ERROR]: The USB port '$BUS_INFO' of interface '$iface' was not found in the predefined USB_PORTS list."
+        echo "[INFO]: Current predefined USB_PORTS configuration:"
+        for k in "${!USB_PORTS[@]}"; do
+            echo "        '$k'"
+        done
+        echo "[HINT]: Please check if the USB device is inserted into the correct port, or update the USB_PORTS config if needed."
+        # echo "↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑---err---↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑"
+    fi
+    echo "-----------------------------------------------------------------"
+done
+
+# Calculation failed USB port
 for k in "${!USB_PORT_STATUS[@]}"; do
-    # 使用${变量:-}避免未定义变量错误
-    if [ "${USB_PORT_STATUS[$k]:-}" != "success" ]; then
-        log_error "Expected CAN interface on USB port $k not found/activated."
+    if [ "${USB_PORT_STATUS[$k]}" != "success" ]; then
+        echo "❌ Expected CAN interface on USB port '$k' was not found or not activated."
         FAILED_COUNT=$((FAILED_COUNT+1))
     fi
 done
 
-# 10. 输出最终结果
-echo -e "\n===================== Result ====================="
+# Final Tips
 if [ "$SUCCESS_COUNT" -gt 0 ]; then
-    log_success "$SUCCESS_COUNT CAN interfaces configured successfully."
+    echo "[RESULT]: ✅ $SUCCESS_COUNT expected CAN interfaces processed successfully."
 else
-    log_error "No CAN interfaces matched the configuration."
+    echo "[RESULT]: ❌ No USB interface matches the preset CAN configuration, please check whether the USB port is connected correctly."
 fi
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
-    log_error "$FAILED_COUNT CAN interfaces failed to configure."
-fi
-
-# 11. 返回退出码
-if [ "$FAILED_COUNT" -gt 0 ]; then
-    exit 2
-elif [ "$SUCCESS_COUNT" -eq 0 ]; then
-    exit 1
-else
-    exit 0
+    echo "[RESULT]: 🚫 $FAILED_COUNT expected CAN interfaces failed to activate or were not found."
 fi
